@@ -1,2 +1,2 @@
 # coexistence-dipterocarp-forest
-Mycorrhiae-mediated species coexistence in mixed dipterocarp forests through plant-soil feedback experiments (chapter 2)
+This study draws on two plant-soil feedback experiments, one in the field and another in the shade house, to identify stabilization (leading to coexistence) outcomes for pairs of coexisting species in a mixed dipterocarp forests. The species set include pairs that host the same mycorrhizal guild (conmycorrhizal pair) and pairs that host contrasting mycorrhizal guilds (heteromycorrhizal pairs). The experiments were conducted between May 2021 and Jan 2023 in the Sinharaja Biosphere Reserve in South-West Sri Lanka. 
