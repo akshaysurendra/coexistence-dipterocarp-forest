@@ -1,0 +1,372 @@
+---
+title: "Preparing dataframes from raw data"
+author: "AS"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,message = FALSE)
+rm(list=ls())
+```
+
+# Data preparation
+### cleaning field experiment data
+
+```{r echo=F,eval=FALSE}
+
+library(tidyverse)
+library(powerjoin)
+library(readxl)
+library(openxlsx)
+library(plotly)
+library(reshape2)
+
+tmpA <- read_xlsx(path = "data/FieldPSF_adultTree-initialB-monitoring-finalB.xlsx",
+                  sheet = 1,skip = 1)
+tmpB <- read_xlsx(path = "data/PSF_harvestdata_2023.xlsx",
+                  sheet = "fpsf_fin_harvest")
+
+fpsf_fin <-
+  tmpB %>% mutate(Biomass.fin = Wt_d_stem + Wt_d_leaf,
+                  Status = "alive",
+                  Neighbour.sp = substr(Tree,1,2),
+                  PlotID = paste0(Tree,Plot),
+                  Height.fin = Length_S/10,
+                  Seedling.sp = Tag) %>%
+  select(Status,Biomass.fin,Height.fin,Neighbour.sp,
+         Seedling.sp,PlotID,No_of_leaves)
+
+fpsf_ini <-
+  tmpA %>% mutate(Height.ini = S_ln,
+                  Biomass.ini = Wt,
+                  Leaves.ini = ifelse(L1_l==".",0,1) + ifelse(L2_l==".",0,1) + ifelse(L3_l==".",0,1) + ifelse(L4_l==".",0,1) + ifelse(L5_l==".",0,1) + ifelse(L6_l==".",0,1),
+                  Plot_topo = Topography,
+                  PhotoID = Canopy_photo,
+                  Canopy_gap_TODO = NA_real_,
+                  Seedling.sp = substr(S.ID,1,2),
+                  Neighbour.sp = substr(T.ID,1,2),
+                  Conspecific.YN = ifelse(Neighbour.sp==Seedling.sp,"Y","N"),
+                  Seedling.myco = ifelse(Seedling.sp %in% c("DZ","ST"),"EcM","AM"),
+                  PlotID = paste0(T.ID,substr(S.ID,4,4))) %>%
+  select(Seedling.sp,Neighbour.sp,PlotID,
+         PhotoID,Plot_topo,Canopy_gap_TODO,
+         Biomass.ini,Height.ini,Leaves.ini,Conspecific.YN,
+         Seedling.myco)
+
+fpsf_tmp <- left_join(x = fpsf_ini,fpsf_fin, by = c("PlotID","Seedling.sp","Neighbour.sp")) %>%
+  mutate(Status = ifelse(is.na(Status),"dead",Status),
+         Seedling = ifelse(Seedling.sp=="BC","Bhesa_ceylanica",
+                           ifelse(Seedling.sp=="HI","Horsfieldia_irya",
+                                  ifelse(Seedling.sp=="DZ","Dipterocarpus_zeylanicus","Shorea_trapezifolia"))),
+         Soil = ifelse(Neighbour.sp=="BC","Bhesa_ceylanica",
+                           ifelse(Neighbour.sp=="HI","Horsfieldia_irya",
+                                  ifelse(Neighbour.sp=="DZ","Dipterocarpus_zeylanicus","Shorea_trapezifolia")))) %>%
+  rename(Leaves.fin = No_of_leaves)
+
+# fpsf_gapfrac.coveRmethod <- # not using this information, random effect of plotID captures among-plot heterogeneity, including light
+#   read_csv("data/data_fPSF_canopycover_from_coveRpackage.csv"# ) %>%
+#   select(id,GF) %>%
+#   mutate(PhotoID = as.numeric(substr(id,5,8))) %>% # select(-id)
+
+fpsf <-
+  fpsf_tmp %>%
+  mutate(Height.fin = round(Height.fin,1),
+         Height.ini = round(Height.ini,1)) %>%
+  select(-PhotoID,-Canopy_gap_TODO,-Plot_topo) # not using this information in the analysis
+#   left_join(x=.,y = fpsf_gapfrac.coveRmethod,by = "PhotoID")
+
+write_csv(x = fpsf,file = "data/fpsf_inputfile.csv")
+```
+
+### cleaning shade house data
+
+```{r echo=F,eval=FALSE}
+
+
+
+names <- readxl::excel_sheets(path = "data/PSF_harvestdata_2023.xlsx")
+
+db_wt0 <- read_xlsx(path = "data/PSF_harvestdata_2023.xlsx",
+                   sheet = "spsf_entry_wt") %>%
+  filter(Tag!="DZHI15A")
+# DZHI15A missing in ht data,
+# could be DZHI13 in which case missing ht data
+
+db_wt <- 
+  db_wt0 %>% arrange(Tag,Leaves) %>%
+  mutate(category = rep(x = c("d","w"), #d=dry,w=wet
+                        times = nrow(db_wt0)/2))
+#because drier is always lighter
+
+db_ht <- 
+  read_xlsx(path = "data/PSF_harvestdata_2023.xlsx",
+            sheet = "spsf_entry_htphoto")
+
+db_wt2 <-
+  full_join(x = dcast(data = db_wt,
+                      formula = Tag ~ category, value.var = "Stem") %>% 
+              rename(Wt_d_stem = d, Wt_w_stem = w),
+            
+            y = full_join(x = dcast(data = db_wt,
+                                    formula=Tag ~ category,
+                                    value.var = "Root") %>% 
+                            rename(Wt_d_root=d, Wt_w_root=w),
+                          
+                          y = dcast(data = db_wt,
+                                    formula = Tag ~ category,
+                                    value.var = "Leaves") %>% 
+                            rename(Wt_d_leaf=d, Wt_w_leaf=w)))
+
+db_spsf <-
+  full_join(x = db_ht %>%
+              select(SlNo,BlkNo,TagNo,Species,Nleaf,Length_S,Length_R,leaf_scanNo) %>% 
+              rename("Tag"="TagNo") %>%
+              mutate(Length_S=as.numeric(Length_S),
+                     #as.numeric(db_ht$Length_S[-which(db_ht$Length_S=="NA")]) # - warning only cause of NA
+                     Length_R=as.numeric(Length_R)),
+                     # as.numeric(db_ht$Length_R[-which(db_ht$Length_R=="NA")])# - warning only cause of NA
+            y = db_wt2)
+
+# write_csv(x = db_spsf,file = "data/spsf_harvestData.csv")
+
+spsf1 <- read_xlsx("data/shadehousePSF_initialB.xlsx") #478
+spsf2 <- read_xlsx("data/shadehousePSF_monitoring.xlsx") #478
+spsf3 <-  read_csv("data/spsf_harvestData.csv")
+spsf4 <- read_xlsx(path = "data/PSF_harvestdata_2023.xlsx",
+                   sheet = "spsf_soilsourceID")
+
+# all wet & dry weight
+spsf <-
+  full_join(
+    x = spsf1[,c("D_o_plant","Tag","Total_wt","t0_ht","t0_lf","Root_len")] %>%
+      rename(Wt_w_tot.ini = Total_wt,Height.ini = t0_ht,Leaves.ini = t0_lf,Depth.ini = Root_len) %>%
+      mutate(Depth.ini = round(as.numeric(Depth.ini),1)),
+    y = spsf3 %>%
+      rename(Block = BlkNo, Leaves.fin = Nleaf, Height.fin = Length_S,Depth.fin = Length_R,
+             Wt_w_leaf.fin = Wt_w_leaf,
+             Wt_w_stem.fin = Wt_w_stem,
+             Wt_w_root.fin = Wt_w_root,
+             Wt_d_leaf.fin = Wt_d_leaf,
+             Wt_d_stem.fin = Wt_d_stem,
+             Wt_d_root.fin = Wt_d_root) %>%
+       mutate(Wt_w_tot.fin = Wt_w_leaf.fin + Wt_w_stem.fin + Wt_w_root.fin,
+              Wt_d_tot.fin = Wt_d_leaf.fin + Wt_d_stem.fin + Wt_d_root.fin,
+              Wt_w_agb.fin = Wt_w_leaf.fin + Wt_w_stem.fin,
+              Wt_d_agb.fin = Wt_d_leaf.fin + Wt_d_stem.fin),
+    by = "Tag") %>%
+  mutate(D_o_harvest = "2022-12-23",
+         D_o_planting = paste0("2021-",substr(D_o_plant,4,6),substr(D_o_plant,1,2))) %>%
+  select(-D_o_plant) %>%
+  mutate(timediff_indays = as.numeric(as.Date(D_o_harvest) - as.Date(D_o_planting)),
+         Leaves.ini = floor(Leaves.ini),
+         Survival = ifelse(!is.na(Wt_w_stem.fin),1,0)) %>%
+  mutate(D_o_harvest = ifelse(is.na(Wt_w_stem.fin),NA_character_,D_o_harvest),
+         timediff_indays = ifelse(is.na(Wt_w_stem.fin),NA_character_,timediff_indays),
+         Height.ini = round(Height.ini,1), #LCM of least count
+         Height.fin = round(Height.fin/10,1), # cant be more precise than 0.1 cm
+         Depth.fin = round(Depth.fin/10,1)) %>%
+
+  mutate(Lrr.leaf_no = ifelse(Leaves.ini>0,
+                              log(as.numeric(Leaves.fin)/as.numeric(Leaves.ini)),
+                              log(as.numeric(Leaves.fin)/1)),
+         Lrr.stem_ht = log(Height.fin/Height.ini),
+         Lrr.tot_w_wt = log(Wt_w_tot.fin/Wt_w_tot.ini),
+
+         Soil.sp = substr(Tag,1,2),
+         Seedling.sp = substr(Tag,3,4),
+         Soil = case_when(
+           Soil.sp=="BC" ~ "Bhesa_ceylanica",
+           Soil.sp=="DZ" ~ "Dipterocarpus_zeylanicus",
+           Soil.sp=="HI" ~ "Horsfieldia_irya",
+           Soil.sp=="MF" ~ "Mesua_ferrea",
+           Soil.sp=="SC" ~ "Shorea_congestiflora",
+           Soil.sp=="ST" ~ "Shorea_trapezifolia"),
+         Seedling = case_when(
+           Seedling.sp=="BC" ~ "Bhesa_ceylanica",
+           Seedling.sp=="DZ" ~ "Dipterocarpus_zeylanicus",
+           Seedling.sp=="HI" ~ "Horsfieldia_irya",
+           Seedling.sp=="SC" ~ "Shorea_congestiflora",
+           Seedling.sp=="ST" ~ "Shorea_trapezifolia"),
+
+         Sp.myco = ifelse(Seedling.sp %in% c("SC","ST","DZ"),"EcM","AM"),
+         Status=ifelse(is.na(Height.fin),1,0), #hazard
+         ConYN=ifelse(Seedling.sp==Soil.sp,"Y","N")) %>%
+
+  mutate(Status=ifelse(Tag %in% c("STDZ08","SCHI09","STHI05"),1,Status),
+         Height.fin=ifelse(Tag %in% c("STDZ08","SCHI09","STHI05"),NA,Height.fin),
+         Leaves.fin=ifelse(Tag %in% c("STDZ08","SCHI09","STHI05"),NA,Leaves.fin)) %>%
+  #these were coerced into 'dead' category because they were half-dead when measuring
+
+  left_join(y = spsf4 %>% select(SoilTree_ID,SoilTree_Tag,Tag),by = "Tag")
+# checked, all the warnings are errors convering NA from text to NA_numeric_ in rootlength variable
+
+write_csv(x = spsf,file = "data/spsf_inputfile.csv")
+
+# data checks
+# chk1 <-   plot_ly(data=spsf %>% filter(Species=="Congesti",Wt_d_stem.fin>0),
+#           y=~log10(Wt_d_agb.fin), x = ~log10(Height.fin),
+#           fillcolor = ~Block, type="scatter",mode='markers',text = ~Tag)
+# chk1 # manually check chk1
+
+
+```
+
+### putting all datasets together
+
+```{r}
+
+fpsf_all <-
+  read_csv(file = "data/fpsf_inputfile.csv") %>%
+  left_join(x = .,y = read_csv(file = "data/phylogeny_PSFexpspecies.csv"),
+            by = c("Soil"="X1","Seedling"="X2")) %>%
+  mutate(Phylodist = log(phylodist_Mya+1)) %>% # +1 to avoid
+  dplyr::select(Status, Biomass.fin,Height.fin,Leaves.fin, #Response variables
+                Conspecific.YN, Seedling.myco, Neighbour.sp, Phylodist, # fixed effect predictors
+                Seedling.sp, PlotID, Height.ini, Leaves.ini,Biomass.ini) #random effects
+
+sc_hts_fpsf <-
+  fpsf_all %>% group_by(Seedling.sp) %>%
+  summarise(mean_Height.ini = mean(Height.ini,na.rm=T),
+            sd_Height.ini = sd(Height.ini,na.rm=T))
+
+# some horsfieldia irya were planted with no initial leaves: we manually set it to 1
+fpsf_all[which(fpsf_all %>% pull(Leaves.ini)==0),"Leaves.ini"] <- 1
+
+sc_lvs_fpsf <-
+  fpsf_all %>% group_by(Seedling.sp) %>%
+  summarise(mean_Leaves.ini = mean(Leaves.ini,na.rm=T),
+              sd_Leaves.ini = sd(Leaves.ini,na.rm=T))
+
+fpsf <-
+  fpsf_all %>%
+  left_join(sc_hts_fpsf,by = "Seedling.sp") %>%
+  left_join(sc_lvs_fpsf,by = "Seedling.sp") %>%
+  mutate(Height.ini_sc = (Height.ini - mean_Height.ini)/sd_Height.ini,
+         Leaves.ini_sc = (Leaves.ini - mean_Leaves.ini)/sd_Leaves.ini) %>%
+  dplyr::select(-mean_Height.ini,-sd_Height.ini) %>%
+  mutate(rgr_rate0 = (log(Height.fin) - log(Height.ini))/(2023-2022),
+         rgr_leaf0 = (log(Leaves.fin) - log(Leaves.ini))/(2023-2022),
+         rgr_biomass0 = (log(Biomass.fin) - log(Biomass.ini))/(2023-2022),
+         Status = ifelse(Status=="alive",1,0)) %>%
+  
+  mutate(offset_term =
+           case_when(
+             Seedling.sp == "ST" ~ (12/17),
+             Seedling.sp %in% c("HI","BC","DZ") ~ (12/18)),.default = NA_real_) %>%
+  
+  mutate(rgr_rate = rgr_rate0*offset_term,
+         rgr_biomass = rgr_biomass0*offset_term,
+         rgr_leaf = rgr_leaf0*offset_term,
+         Height.fin_sc =  Height.fin*offset_term,
+         Biomass.fin_sc = Biomass.fin*offset_term,
+         Leaves.fin_sc =  Leaves.fin*offset_term,
+         TreeID = substr(PlotID,1,4),
+         #gapfrac_sq = sqrt(gapfrac),
+         Biomass.ini_by10 = Biomass.ini/10) %>% 
+  
+  rename(Height.ini_orig = Height.ini,
+         Biomass.fin_orig = Biomass.fin) %>% 
+  
+  mutate(Height.ini = log(Height.ini_orig),
+         Biomass.fin = log(Biomass.fin_orig),
+         Biomass.fin_orig = ifelse(test = is.na(Biomass.fin_orig),
+                                   yes = 0,no = Biomass.fin_orig))
+
+### shade house ######
+
+spsf_all <-
+  left_join(x = read_csv(file = "data/spsf_inputfile.csv"),
+            y = read_csv(file = "data/Phylogeny_PSFexpSpecies.csv"),
+            by = c("Soil"="X1","Seedling"="X2")) %>%
+  #left_join(x = .,y = read_csv("data/spsf_inputfile_soildata.csv"), by = "Tag") %>%
+
+  mutate(Phylodist = log(phylodist_Mya+1), # log-transformed, +1 to avoid log(0) singularity for home soil
+         Conspecific.YN = factor(ConYN,levels=c("N","Y"))) %>%
+
+  mutate(Leaves.ini = ifelse(Leaves.ini==0,1,Leaves.ini)) %>% # some HORSIR had no leaves initially, set it to 1 manually to avoid Inf in rgr calc
+
+  rename(Biomass.fin = Wt_d_agb.fin, Seedling.myco = Sp.myco, Neighbour.sp = Soil.sp, Biomass.ini = Wt_w_tot.ini) %>%
+  # mutate(C_to_N = OC_perc/N_total_perc,
+  #        C_to_P = OC_perc/P_available_ppm) %>%
+
+  dplyr::select(Status, Biomass.fin,Height.fin,Leaves.fin, #Response variables
+                Conspecific.YN, Seedling.myco, Neighbour.sp, Phylodist, # fixed effect predictors
+                Seedling.sp, Block, Height.ini, Leaves.ini,Biomass.ini) #random effects
+               # PC1,PC2,PH,N_total_perc,P_available_ppm,C_to_N,C_to_P,Clay_perc,Sand_perc)
+
+sc_hts_spsf <-
+  spsf_all %>% group_by(Seedling.sp) %>%
+  summarise(mean_Height.ini = mean(Height.ini,na.rm=T),
+            sd_Height.ini =   sd(Height.ini,na.rm=T))
+
+sc_lfs_spsf <-
+  spsf_all %>%
+  group_by(Seedling.sp) %>%
+  summarise(mean_Leaves.ini = mean(Leaves.ini,na.rm=T),
+            sd_Leaves.ini =   sd(Leaves.ini,na.rm=T))
+
+spsf <-
+  spsf_all %>%
+  left_join(.,y = sc_hts_spsf,by = "Seedling.sp") %>%
+  left_join(.,y = sc_lfs_spsf,by = "Seedling.sp") %>%
+  mutate(Height.ini_sc = (Height.ini - mean_Height.ini)/sd_Height.ini,
+         Leaves.ini_sc = (Leaves.ini - mean_Leaves.ini)/sd_Leaves.ini) %>%
+  dplyr::select(-mean_Height.ini,-sd_Height.ini,-mean_Height.ini,-sd_Leaves.ini) %>%
+  mutate(rgr_rate0 = (log(Height.fin) - log(Height.ini))/(2023-2022),
+         rgr_leaf0 = (log(Leaves.fin) - log(Leaves.ini))/(2023-2022),
+         rgr_biomass0 = (log(Biomass.fin) - log(Biomass.ini))/(2023-2022)) %>%
+  mutate(Status = ifelse(Status==1,0,1),  #survival, not mortality (flipping it)
+         SoilSource_TreeID = paste0(Neighbour.sp,"_",Block),
+         Neighbour.myco = ifelse(Neighbour.sp %in% c("SC","ST","DZ"),"EcM","AM"),
+         Conmycorrhizal.YN = ifelse((Conspecific.YN=="N") & (Seedling.myco==Neighbour.myco),"Y",
+                                    ifelse(Conspecific.YN=="Y","Y","N"))) %>%
+  mutate(offset_term = case_when(
+    Seedling.sp == "SC" ~ (12/19),
+    Seedling.sp == "ST" ~ (12/17),
+    Seedling.sp %in% c("HI","BC","DZ") ~ (12/18),.default = NA_real_)) %>%
+  mutate(rgr_rate = rgr_rate0*offset_term,
+         rgr_biomass = rgr_biomass0*offset_term,
+         rgr_leaf = rgr_leaf0*offset_term,
+         Height.fin_sc =  Height.fin*offset_term,
+         Biomass.fin_sc = Biomass.fin*offset_term,
+         Leaves.fin_sc =  Leaves.fin*offset_term,
+         Biomass.ini_by10 = Biomass.ini/10) %>% 
+  
+  filter(Neighbour.sp!="MF") %>% # not needed for this pairwise study
+  rename(Height.ini_orig = Height.ini,
+         Biomass.fin_orig = Biomass.fin) %>% 
+  mutate(Height.ini = log(Height.ini_orig),
+         Biomass.fin = log(Biomass.fin_orig),
+         Biomass.fin_orig = 
+           ifelse(test = is.na(Biomass.fin_orig),
+                  yes = 0,no = Biomass.fin_orig))
+
+# time of planting, time of harvest, years of sampling
+# SC (shadehouse only ): Jul 2021 | Jan 2023 | 19m/12
+# ST (shadehouse+field): Sep 2021 | Jan 2023 | 17m/12
+# DZ (shadehouse+field): Aug 2021 | Jan 2023 | 18m/12
+# HI (shadehouse+field): Aug 2021 | Jan 2023 | 18m/12
+# BC (shadehouse+field): Aug 2021 | Jan 2023 | 18m/12
+
+# need to account for offset in time: used as interval, scaled to annual (/12) - rgr_ and _sc response variables are scaled to annual rates
+# SC- 19 months
+# ST- 17 months
+# HI- 18 months
+# BC- 18 months
+# DZ- 18 months
+
+# Saving files #####
+
+reduced_spsf <- 
+  spsf %>% select(Status,Biomass.fin_orig,Height.ini_sc,Seedling.sp,Neighbour.sp,SoilSource_TreeID,Phylodist)
+
+reduced_fpsf <- 
+  fpsf %>% select(Status,Biomass.fin_orig,Height.ini_sc,Seedling.sp,Neighbour.sp,TreeID,Phylodist)
+
+
+write_csv(x = reduced_fpsf,file = "data/fpsf_final.csv")
+write_csv(x = reduced_spsf,file = "data/spsf_final.csv")
+```

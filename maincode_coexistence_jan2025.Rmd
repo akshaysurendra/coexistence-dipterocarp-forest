@@ -1,0 +1,597 @@
+---
+title: "Stabilization through pairwise PSF experiments"
+author: "AS LSC"
+date: "January 24th, 2025"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,message = FALSE)
+rm(list=ls())
+```
+
+# Main Text
+
+We run models to estimate average survival-adjusted growth coefficients from 
+interaction-only models using a zero-inflated gamma model
+
+The interaction coefficient is calculated from above coefficients using the log-form 
+of the bever 2003 equation for I_s, as used in Crawford et al 2019
+
+```{r}
+
+### packages
+library(tidyverse)
+library(nlme)
+library(lme4)
+library(lmerTest)
+library(lmeresampler)
+library(broom.mixed)
+library(sjPlot)
+library(glmmTMB)
+library(tictoc)
+library(broom.mixed)
+library(patchwork)
+library(performance)
+library(AICcmodavg)
+library(patchwork)
+library(ggsignif)
+
+fpsf <- read_csv(file = "data/fpsf_final.csv")
+
+spsf <- read_csv(file = "data/spsf_final.csv")
+
+# Pair PSF models (ZIF-gamma)
+
+m_pair.shade <- glmmTMB(data = spsf,
+                   formula = Biomass.fin_orig ~ -1 + Height.ini_sc + Seedling.sp:Neighbour.sp + (1|SoilSource_TreeID),
+                   family = ziGamma(link = "log"),ziformula = ~.)
+
+m_pair.field <- glmmTMB(data = fpsf,
+                   formula = Biomass.fin_orig ~ -1 + Height.ini_sc + Seedling.sp:Neighbour.sp + (1|TreeID),
+                   family = ziGamma(link = "log"),ziformula = ~.,se = T)
+
+models_a2 <- list(m_pair.shade,m_pair.field)
+names(models_a2) <- c("spsf_pair","fpsf_pair")
+save(models_a2,file = "results/model_objects.rdata")
+
+```
+
+### Computing Is and Is's CIs from models
+
+```{r echo=T,message=F,include=TRUE,warning=FALSE}
+
+load("results/model_objects.rdata")
+splist0 <- c("ST","DZ","HI","BC","SC")
+
+# function to calculate interaction coefficients for all pairs of species in an 
+# experiment when model coefficients are supplied to it
+iscalc <- function(biomass_co,logodds_co) 
+{
+  biomass_coef <- biomass_co
+  logodds_coef <- logodds_co
+  alpha <- exp(biomass_coef) * (1 - (exp(logodds_coef) / (1 + exp(logodds_coef))))
+  # exp(biomass) because biomass/growth coefficient is on the log-scale;
+  # exp(coeff) / (1 + exp(coeff) gives mortality probability
+  # 1- above gives survival probability
+  
+  amat <- 
+    alpha %>% 
+    log() %>% #re dudenhoffer 2022 and Crawford 2019
+    as_tibble(rownames = "pred") %>% 
+    filter(pred != "Height.ini_sc") %>% 
+    separate(col = "pred",
+             into = c("seed","soil"),
+             sep = ":") %>%
+    mutate(soil_source = substr(soil,nchar(soil)-1,nchar(soil)),
+           seed_source = substr(seed,nchar(seed)-1,nchar(seed))) %>% 
+    select(-seed,-soil) %>% 
+  pivot_wider(names_from = soil_source,
+              values_from = value) %>% 
+    column_to_rownames("seed_source")
+  
+  is <- 
+    tibble(ispair = combn(x = splist0,m = 2) %>% t() %>% 
+             as_tibble() %>% 
+             mutate(ispair = paste0(V1,"_",V2)) %>% 
+             pull(ispair),
+               isval = NA_real_) %>% 
+    column_to_rownames("ispair")
+
+  is["ST_DZ","isval"] <- amat["ST","ST"] - amat["ST","DZ"] + amat["DZ","DZ"] - amat["DZ","ST"]
+  is["ST_HI","isval"]  <- amat["ST","ST"] - amat["ST","HI"] + amat["HI","HI"] - amat["HI","ST"]
+  is["ST_BC","isval"] <- amat["ST","ST"] - amat["ST","BC"] + amat["BC","BC"] - amat["BC","ST"]
+  is["DZ_HI","isval"]  <- amat["DZ","DZ"] - amat["DZ","HI"] + amat["HI","HI"] - amat["HI","DZ"]
+  is["DZ_BC","isval"] <- amat["DZ","DZ"] - amat["DZ","BC"] + amat["BC","BC"] - amat["BC","DZ"]
+  is["HI_BC","isval"]  <- amat["HI","HI"] - amat["HI","BC"] + amat["BC","BC"] - amat["BC","HI"]
+  
+  if(ncol(amat) == 5) # shade house has 5 species, 1 extra species compared to field
+  { 
+    is["ST_SC","isval"] <- amat["SC","SC"] - amat["SC","ST"] + amat["ST","ST"] - amat["ST","SC"]
+    is["DZ_SC","isval"]  <- amat["SC","SC"] - amat["SC","DZ"] + amat["DZ","DZ"] - amat["DZ","SC"]
+    is["HI_SC","isval"] <- amat["SC","SC"] - amat["SC","HI"] + amat["HI","HI"] - amat["HI","SC"]
+    is["BC_SC","isval"]  <- amat["SC","SC"] - amat["SC","BC"] + amat["BC","BC"] - amat["BC","SC"]
+  }
+return(is)
+}
+
+# Calculating mean Is values ####
+is_shade <- 
+  iscalc(biomass_co = fixef(models_a2$spsf_pair)$cond, # conditional coefficient - gamma distribution 
+         logodds_co = fixef(models_a2$spsf_pair)$zi) %>%  # zero-inflated componenet
+  rownames_to_column("pair")
+
+is_field <- 
+  iscalc(biomass_co = fixef(models_a2$fpsf_pair)$cond,
+         logodds_co = fixef(models_a2$fpsf_pair)$zi) %>% 
+  filter(!is.na(isval)) %>% # for SC species, not included in the field study
+  rownames_to_column("pair")
+
+
+# Calculating CIs around Is values through bootstrapping ####
+
+nsims <- 9999
+
+# myfunc extracts coefficients from the model input
+myfunc <- function(x) { return(c(fixef(x)[[1]],fixef(x)[[2]]))}
+ 
+tic()
+ shade_boot <- 
+   lme4::bootMer(x = models_a2[[1]],
+                 FUN = myfunc,
+                 nsim = nsims,
+                 type = "parametric",
+                 .progress = "txt")
+ save(shade_boot,file = "results/shade_boot.RData")
+toc()
+
+tic() 
+ field_boot <- 
+   lme4::bootMer(x = models_a2[[2]],
+                 FUN = myfunc,
+                 nsim = nsims,
+                 type = "parametric",
+                 .progress = "txt")
+ 
+ save(field_boot,file = "results/field_boot.RData")
+toc()
+
+load("results/shade_boot.RData")
+load("results/field_boot.RData")
+
+ isci <- vector("list",2)
+ names(isci) <- c("shade","field")
+ isci[[1]] <- isci[[2]] <- vector("list",length = nsims)
+ names(isci$shade) <- names(isci$field)
+ 
+ for(i in 1:nsims) # takes a lot of time for n=9999
+ {   
+   isci$shade[[i]] <- iscalc(biomass_co = shade_boot$t[i,1:26],
+                               logodds_co = shade_boot$t[i,27:52]) #5x5+1
+ 
+   isci$field[[i]] <- iscalc(biomass_co = field_boot$t[i,1:17],
+                             logodds_co = field_boot$t[i,18:34]) #4x4+1
+     if(i %%100 == 0) {
+       cat(paste0("currently on",i,"\n"))
+       }
+ }
+
+ isci_s <- bind_cols(isci$shade) # ~ 5 mins
+ names(isci_s) <- paste0("iter",
+                         str_pad(string = c(1:nsims),width = 4,side = "left",pad = 0))
+ isci_f <- bind_cols(isci$field) # ~ 5 mins
+ names(isci_f) <- paste0("iter",
+                         str_pad(string = c(1:nsims),width = 4,side = "left",pad = 0))
+
+ # save(isci_s,file = "results/isci_s.RData")
+ # save(isci_f,file = "results/isci_f.RData")
+
+#####
+
+load("results/isci_s.RData")
+load("results/isci_f.RData")
+
+# removing infinite values and plotting coefficients to check for outliers
+isci_shade <- t(isci_s) %>% apply(.,MARGIN = 2,FUN = function(xx) ifelse(is.infinite(xx),NA_real_,xx)) %>% as_tibble()
+isci_field <- t(isci_f) %>% apply(.,MARGIN = 2,FUN = function(xx) ifelse(is.infinite(xx),NA_real_,xx)) %>% as_tibble() %>%
+  select(-ST_SC,-DZ_SC,-HI_SC,-BC_SC) 
+
+# visualize coefficient spread
+ par(mfrow = c(2,5))
+ apply(X = isci_shade,MARGIN = 2,FUN = hist)
+ par(mfrow = c(2,3))
+ apply(X = isci_field,MARGIN = 2,FUN = hist)
+
+ # see values of coefficient spread
+field_coefsummary <- apply(X = isci_field,MARGIN = 2,FUN = summary) # bias correction is not needed
+shade_coefsummary <- apply(X = isci_shade,MARGIN = 2,FUN = summary) # removing outliers manually on seeing the columns:
+# e.g. sort(isci_shade$ST_DZ,decreasing = T)[1:100]
+# which(isci_shade$ST_DZ>2) # 2 entries
+# which(isci_shade$DZ_BC>2) # 2 entries
+# which(isci_shade$HI_SC>2.9) # 2 entries
+# which(isci_shade$DZ_SC>3.5) # 4 entries
+isci_shade$ST_DZ[which(isci_shade$ST_DZ>2)] <- NA_real_ 
+isci_shade$DZ_BC[which(isci_shade$DZ_BC>2)] <- NA_real_ 
+isci_shade$HI_SC[which(isci_shade$HI_SC>2.9)] <- NA_real_ 
+isci_shade$DZ_SC[which(isci_shade$DZ_SC>3.5)] <- NA_real_ 
+
+isboth <- bind_rows(
+  
+  is_shade %>%  
+    mutate(is_lci = apply(X = isci_shade,MARGIN = 2, FUN = function(x) quantile(x,probs = 0.025,na.rm = T)),
+           is_uci = apply(X = isci_shade,MARGIN = 2, FUN = function(x) quantile(x,probs = 0.975,na.rm = T)),
+           # is_se = apply(X = isci_shade, MARGIN = 2, function(xx) sd(xx,na.rm=T)),
+           # lower_2se = isval - 2*is_se,lower_1se = isval - 1*is_se,
+           # upper_2se = isval + 2*is_se,upper_1se = isval + 1*is_se,
+           # pval = ifelse(lower_2se<0 & upper_2se < 0, "**",ifelse(lower_2se > 0 & upper_2se > 0, "**","ns")),
+           mycopair = ifelse(pair %in% c("ST_DZ","ST_SC","DZ_SC"),yes = "conmycorrhizal",
+                             no = ifelse(pair == "HI_BC","conmycorrhizal","heteromycorrhizal")),
+           dataset = "shadehouse",
+           pair = factor(pair,levels = c("ST_DZ","ST_SC","DZ_SC","HI_BC","ST_HI","ST_BC","DZ_HI","DZ_BC","HI_SC","BC_SC"))),
+  
+  is_field %>% 
+  mutate(is_lci = apply(X = isci_field,MARGIN = 2, FUN = function(x) quantile(x,probs = 0.025,na.rm = T)),
+         is_uci = apply(X = isci_field,MARGIN = 2, FUN = function(x) quantile(x,probs = 0.975,na.rm = T)),
+         # is_se = apply(X = isci_field, MARGIN = 2, function(xx) sd(xx,na.rm=T)),
+         # lower_2se = isval - 2*is_se,lower_1se = isval - 1*is_se,
+         # upper_2se = isval + 2*is_se,upper_1se = isval + 1*is_se,
+         # pval = ifelse(lower_2se<0 & upper_2se < 0, "**",ifelse(lower_2se > 0 & upper_2se > 0, "**","ns")),
+         mycopair = ifelse(pair %in% c("ST_DZ","ST_SC","DZ_SC"),yes = "conmycorrhizal",
+                           no = ifelse(pair == "HI_BC","conmycorrhizal","heteromycorrhizal")),
+         dataset = "field",
+        pair = factor(pair,levels = c("ST_DZ","HI_BC","ST_HI","ST_BC","DZ_HI","DZ_BC")))) %>% 
+  mutate(dataset = factor(dataset,levels=c("shadehouse","field")))
+
+write_csv(x = isboth,file = "results/isboth.csv")
+
+```
+
+### Figure 2 and 3
+
+```{r echo=T,message=F,include=TRUE,warning=FALSE}
+rm(list=ls())
+
+isboth <- 
+  read_csv(file = "results/isboth.csv") %>% 
+  mutate(pair = 
+           factor(pair,
+                  levels = c("ST_DZ","ST_SC","DZ_SC","HI_BC", # conmyco
+                             "ST_HI","ST_BC","DZ_HI","DZ_BC","HI_SC","BC_SC")), # heteromyco
+         dataset = ifelse(dataset=="shadehouse","shade house",dataset),
+         dataset = factor(dataset,
+                  levels = c("shade house","field")))
+  
+
+# Figure 2 #### 
+
+fig2 <- 
+  ggplot(data = isboth,
+         aes(y = isval,x = pair)) + 
+  geom_hline(yintercept = 0,linetype = 2) +
+  geom_col(aes(fill = mycopair),colour="black",linewidth=0.5) + 
+  scale_fill_manual(name="",values = c("steelblue1","tomato4")) + 
+  geom_errorbar(aes(ymin = is_lci, ymax = is_uci),
+                linewidth =0.5,width=0.15) + 
+  facet_grid(.~dataset,scales = "free_x",space = "free_x",drop = T) + 
+  theme_classic() + 
+  xlab("Species pairs") + ylab(expression("Interaction Coefficient, I"[s])) + 
+  ggtitle("") +
+  theme(legend.position = "top",
+        panel.border = element_rect(colour = "black", fill=NA, linewidth=1),
+        axis.text.x = element_text(angle = 45,vjust = 0.5))
+
+ggsave(plot = fig2, # tiff would be nice but too big for github!
+       filename = "results/fig2.png",device = "png",
+       width = 8.3, height = 7, units = "in",dpi=600)
+
+# Figure 3 #####
+
+dat_fig3 <- isboth[,c("pair","isval","dataset")] %>% 
+  mutate(dataset = factor(dataset,levels = rev(c("shade house","field"))))
+
+fig3 <- 
+  ggplot(data = dat_fig3,
+                mapping = aes(y=dataset,x=isval)) + 
+  
+  geom_point(data = dat_fig3 %>% 
+                   group_by(dataset) %>% summarize(mu = mean(isval)),
+               mapping = aes(y=dataset,x=mu),
+             colour="black",fill="grey50",stroke=1, size=4,shape=21) + 
+    
+  geom_jitter(alpha=0.7,size=3,height = 0.1,shape=1) + 
+    theme_bw() + ylab("") + xlab("Interaction coefficient") + xlim(-2,2) + 
+  geom_signif(comparisons = list(c("shade house","field")),
+                test = "wilcox.test",
+              test.args = list(alternative="two.sided",paired=F),
+              map_signif_level = function(p) sprintf("p = %.2g", p),
+              textsize = 3, y_position = c(1.5))
+                
+ggsave(plot = fig3,
+       filename = "results/fig3.png",
+       device = "png",width = 4, height = 1.5, units = "in",dpi=600)
+```
+
+# Supplementary Information
+
+### Table A1: Model comparison with AIC (and R^2 - marginal only) to identify the predictor of initial size
+
+```{r}
+rm(list = ls())
+
+spsf <- read_csv(file = "data/spsf_final.csv")
+fpsf <- read_csv(file = "data/fpsf_final.csv")
+
+# Biomass.fin ~ Biomass.ini + ...
+
+maic_spsf <- list(
+  glmmTMB(data = spsf,
+              formula = Biomass.fin_orig ~ -1 + Height.ini_sc + Seedling.sp:Neighbour.sp + (1|SoilSource_TreeID),
+              family = ziGamma(link = "log"),ziformula = ~.),
+  glmmTMB(data = spsf,
+              formula = Biomass.fin_orig ~ -1 + Leaves.ini_sc + Seedling.sp:Neighbour.sp + (1|SoilSource_TreeID),
+              family = ziGamma(link = "log"),ziformula = ~.),
+  glmmTMB(data = spsf %>% mutate(Biomass.ini_sc = scale(Biomass.ini)),
+              formula = Biomass.fin_orig ~ -1 + Biomass.ini_sc + Seedling.sp:Neighbour.sp + (1|SoilSource_TreeID),
+              family = ziGamma(link = "log"),ziformula = ~.))
+
+maic_fpsf <- list(
+  glmmTMB(data = fpsf,
+              formula = Biomass.fin_orig ~ -1 + Height.ini_sc + Seedling.sp:Neighbour.sp + (1|TreeID),
+              family = ziGamma(link = "log"),ziformula = ~.),
+  glmmTMB(data = fpsf,
+              formula = Biomass.fin_orig ~ -1 + Leaves.ini_sc + Seedling.sp:Neighbour.sp + (1|TreeID),
+              family = ziGamma(link = "log"),ziformula = ~.),
+  glmmTMB(data = fpsf %>% mutate(Biomass.ini_sc = scale(Biomass.ini)),
+              formula = Biomass.fin_orig ~ -1 + Biomass.ini_sc + Seedling.sp:Neighbour.sp + (1|TreeID),
+              family = ziGamma(link = "log"),ziformula = ~.))
+
+mnames <- 
+  expand.grid(c("Height","Leaves","Biomass"),c("spsf","fpsf")) %>% 
+  mutate(mname = paste0(Var2,"_",Var1)) %>% 
+  pull(mname)
+
+r2 <- c(
+  lapply(maic_spsf,FUN = function(x) r2_nakagawa(x,tolerance = 0)$R2_marginal),
+  lapply(maic_fpsf,FUN = function(x) r2_nakagawa(x,tolerance = 0)$R2_marginal))
+
+names(r2) <- mnames
+  
+# REML=F just in this supplement because REML=T can't be used for AIC comparison, apparently
+
+tableS1 <- 
+  bind_rows(
+aictab(cand.set = maic_spsf,modnames = mnames[1:3]) %>% as_tibble() %>% 
+  rename(resp=Modnames) %>% mutate(r2=unlist(r2[1:3]),model="s"),
+aictab(cand.set = maic_fpsf,modnames = mnames[4:6]) %>% as_tibble() %>% 
+  rename(resp=Modnames) %>% mutate(r2=unlist(r2[4:6]),model="f"))
+
+write_csv(x = tableS1 %>% 
+            separate(col=resp,
+                     into = c("study","predictor"),
+                     sep="_",remove=T) %>% 
+            select(-LL,-Cum.Wt,-r2,-ModelLik),
+          file = "results/tableA1_AIC_initsize.csv")
+# using Height in the main model because it has the lowest AIC
+```
+
+### Figure A1: Individual PSFs from the zero-inflated model
+
+```{r echo=T,message=F,include=TRUE,warning=FALSE}
+rm(list = ls())
+
+nsims = 9999
+
+load("results/model_objects.rdata")
+load("results/field_boot.RData")
+
+adatcalc <- function(biomass_co,logodds_co) 
+{
+  biomass_coef <- biomass_co
+  logodds_coef <- logodds_co
+  alpha <- exp(biomass_coef) * (1 - (exp(logodds_coef) / (1 + exp(logodds_coef))))
+  # exp(biomass) because biomass/growth coefficient is on the log-scale;
+  # exp(coeff) / (1 + exp(coeff) gives mortality probability
+  # 1- above gives survival probability
+  
+  adat <- 
+    alpha %>% 
+    # log() %>% #re dudenhoffer 2022 and Crawford 2019
+    # ^ not needed to show individual PSFs on observed scale
+    as_tibble(rownames = "pred") %>% 
+    filter(pred != "Height.ini_sc") %>% 
+    separate(col = "pred",
+             into = c("seed","soil"),
+             sep = ":") %>%
+    mutate(soil_source = substr(soil,nchar(soil)-1,nchar(soil)),
+           seed_source = substr(seed,nchar(seed)-1,nchar(seed))) %>% 
+    select(-seed,-soil) %>% 
+    rename(alpha = value)
+  
+  return(adat)
+}
+
+# mean model coefficients - computing survival-adjusted biomass estimates
+indpsf_shade <- 
+  adatcalc(biomass_co = fixef(models_a2$spsf_pair)$cond, # conditional coefficient - gamma distribution 
+         logodds_co = fixef(models_a2$spsf_pair)$zi)  # zero-inflated component
+indpsf_field <- 
+  adatcalc(biomass_co = fixef(models_a2$fpsf_pair)$cond,
+         logodds_co = fixef(models_a2$fpsf_pair)$zi)
+
+# CIs of coefficients computing survival-adjusted biomass for each bootstrap
+indpsf_field_nsims <- indpsf_shade_nsims <- vector(mode = "list",length = nsims)
+names(indpsf_field_nsims) <- names(indpsf_shade_nsims) <- 
+  paste0("iter",
+         str_pad(string = c(1:nsims),width=nchar(nsims),side = "left",pad = "0"))
+tic()
+for(i in 1:nsims)
+{
+  indpsf_field_nsims[[i]] <- adatcalc(biomass_co = field_boot$t[1,c(1:17)],
+                                      logodds_co = field_boot$t[1,c(18:34)])
+  
+  # indpsf_shade_nsims[[i]] <- adatcalc(biomass_co = shade_boot$t[1,c(1:26)],
+  #                                     logodds_co = shade_boot$t[1,c(27:52)])
+  if(i %%100 == 0) {
+       cat(paste0("currently on",i,"\n"))
+       }
+}
+indpsf_field_nsims <- bind_rows(indpsf_field_nsims,.id = "iteration")
+# indpsf_shade_nsims <- bind_rows(indpsf_shade_nsims,.id = "iteration")
+toc()
+
+indpsf_field_nsims_mat <-
+  indpsf_field_nsims %>% 
+  pivot_wider(id_cols = c("seed_source","soil_source"),
+              names_from = iteration,
+              values_from = alpha) %>% 
+  mutate(tag = paste0(seed_source,"_",soil_source))
+
+indpsf_confint_field <-
+  data.frame(
+    lci = 
+      apply(X = as.data.frame(indpsf_field_nsims_mat),MARGIN = 1,
+            FUN = function(x) quantile(x = x,prob = 0.025)),
+    uci = 
+      apply(X = indpsf_field_nsims_mat,MARGIN = 1,
+            FUN = function(x) quantile(x = x,prob = 0.975)))
+# indpsf_confint_shade <-
+#   data.frame(
+#      lci = 
+#        apply(X = indpsf_shade_nsims_mat,MARGIN = 1,
+#              FUN = function(x) quantile(x = x,prob = 0.025)),
+#      uci = 
+#        apply(X = indpsf_shade_nsims_mat,MARGIN = 1,
+#              FUN = function(x) quantile(x = x,prob = 0.975)))
+
+dat_figa1 <- 
+  # bind_rows(
+  indpsf_confint_field %>% rownames_to_column("pair") %>% 
+  separate(col = pair,into = c("seed_source","soil_source"),sep = "_",remove = T) %>% 
+  full_join(x = .,y = indpsf_field,by = c("seed_source","soil_source")) %>% 
+  mutate(dataset = "field")#,
+ #  indpsf_confint_shade %>% rownames_to_column("pair") %>% 
+ #  separate(col = pair,into = c(seed_source,soil_source),sep = "_",remove = T) %>% 
+ #  full_join(x = .,y = indpsf_shade,by = c("seed_source","soil_source")) %>% 
+ #  mutate(dataset = "shade house"))
+
+figa1 <- 
+  lapply(X = models_a2,
+         FUN = function(x) x |> tidy() |> 
+           filter(effect=="fixed",term!="Height.ini_sc") |> 
+           select(term, component, estimate,std.error) |> 
+           separate(col = term,into = c("sp1","sp2"),sep = ":",remove = T) |> 
+           mutate(sp1=substr(sp1,nchar(sp1)-1,nchar(sp1)),
+                  sp2=substr(sp2,nchar(sp2)-1,nchar(sp2)),
+                  lci=estimate - 1.96*std.error,
+                  uci=estimate + 1.96*std.error)) %>% 
+  bind_rows(.,.id = "dataset") %>% 
+  rename(seed_source = sp1, soil_source = sp2)
+         
+names(models_ci_a1) <- c("spsf_g","fpsf_g","spsf_s","fpsf_s")
+
+ind_psfdat <- 
+  dat_figa1 %>% 
+  mutate(
+    seed_myco = 
+      ifelse(seed_source %in% c("BC","HI"),"AM","EcM"),
+    soil_myco = 
+      ifelse(soil_source %in% c("BC","HI","MF"),"AM","EcM"),
+    HA = 
+      ifelse(seed_source!=soil_source,"away","home"),
+    combo = 
+      case_when(
+           seed_myco == "AM" & soil_myco=="EcM" ~  "AM in EcM-trained soil",
+           seed_myco == "AM" & soil_myco=="AM" ~  "AM in AM-trained soil",
+           seed_myco == "EcM" & soil_myco=="AM" ~  "EcM in AM-trained soil",
+           seed_myco == "EcM" & soil_myco=="EcM" ~  "EcM in EcM-trained soil"),
+    dataset = 
+      ifelse(substr(dataset,1,1)=="f","field","shade house"),
+    resp = 
+      ifelse(component=="cond","biomass","zi"),
+         model_name = paste0(resp," (",dataset,")")) %>%
+  mutate(soil_source = factor(soil_source,
+                              levels = c("SC","ST","DZ","BC","HI")),
+         seed_source = factor(seed_source,
+                              levels = c("SC","ST","DZ","BC","HI"))) %>% 
+  rename(obs = estimate,
+         se = std.error)
+
+indcomp_spsf_g <- list( c("0.5", "1"), c("1", "2"), c("0.5", "2") )
+
+p1 <- 
+  ind_psfdat %>% 
+  filter(resp == "biomass",
+         dataset == "shade house") %>% 
+  ggplot(data = .,
+       aes(y = obs,x = soil_source,ymin = lci,ymax = uci)) + 
+    geom_point(aes(colour=combo,shape=HA),size=4) + geom_linerange() + 
+  coord_flip() + coord_trans(y = "log") +
+  facet_wrap(.~seed_source,ncol = 1) + 
+  theme_bw() + theme(legend.position = "top") + 
+  scale_colour_manual(name="",values=c("#1065ab","#8ec4de","#f6a582","#b3152a")) + 
+  scale_shape_manual(name="",values = c(16,1)) + 
+  ylab("modelled above-ground biomass,\n shade house") + xlab("soil-source")
+
+p2 <- 
+  ind_psfdat %>% 
+  filter(resp == "growth-rate",
+         dataset == "shade house") %>% 
+  ggplot(data = ind_psfdat %>% filter(resp=="growth-rate",dataset=="field"),
+       aes(y=obs,x=soil_source,ymin = obs-se,ymax=obs+se)) + 
+    geom_point(aes(colour=combo,shape=HA),size=4) + geom_linerange() + coord_flip() + facet_wrap(.~seed_source,ncol = 1) + 
+    theme_bw() + theme(legend.position = "top")+ scale_colour_manual(name="",values=c("#1065ab","#8ec4de","#f6a582","#b3152a")) + 
+    scale_shape_manual(name="",values = c(16,1)) + ylab("adjusted final biomass,\n field") + xlab("soil-source")
+
+p3 <- ggplot(data = ind_psfdat %>% filter(resp=="survival",dataset=="shadehouse"),
+       aes(y=obs,x=soil_source,ymin = obs-se,ymax=obs+se)) + 
+    geom_point(aes(colour=combo,shape=HA),size=4) + geom_linerange() + coord_flip() + facet_wrap(.~seed_source,ncol = 1) + 
+    theme_bw() + theme(legend.position = "top")+ scale_colour_manual(name="",values=c("#1065ab","#8ec4de","#f6a582","#b3152a")) + 
+    scale_shape_manual(name="",values = c(16,1)) + ylab("adjusted survival\n (log-odds), shadehouse") + xlab("soil-source")
+
+p4 <- ggplot(data = ind_psfdat %>% filter(resp=="survival",dataset=="field"),
+       aes(y=obs,x=soil_source,ymin = obs-se,ymax=obs+se)) + 
+    geom_point(aes(colour=combo,shape=HA),size=4) + geom_linerange() + coord_flip() + facet_wrap(.~seed_source,ncol = 1) + 
+    theme_bw() + theme(legend.position = "top")+ scale_colour_manual(name="",values=c("#1065ab","#8ec4de","#f6a582","#b3152a")) + 
+    scale_shape_manual(name="",values = c(16,1)) + ylab("adjusted survival\n (log-odds), field") + xlab("soil-source")
+
+figA1 <- p1 + p2 + p3 + p4 + plot_layout(guides = "collect",ncol = 4) & theme(legend.position = "top")
+ggsave(filename = "results/figA1_indPSF.png",plot = figS4,device = "png",width = 12,height = 8,units = "in")
+```
+
+### Figure A2: phylogeny dist and Is values model
+ 
+```{r}
+
+isboth <- read_csv(file = "results/isboth.csv")
+
+istot <- isboth %>%  
+  separate(col = pair,into = c("sp1","sp2"),sep = "_",remove = T) %>% 
+  mutate(sp1 = case_when(
+              sp1 == "BC" ~ "Bhesa_ceylanica",
+              sp1 == "SC" ~ "Shorea_congestiflora",
+              sp1 == "ST" ~ "Shorea_trapezifolia",
+              sp1 == "HI" ~ "Horsfieldia_irya",
+              sp1 == "DZ" ~ "Dipterocarpus_zeylanicus",
+              .default = as.character(sp1)),
+         sp2 = case_when(
+              sp2 == "BC" ~ "Bhesa_ceylanica",
+              sp2 == "SC" ~ "Shorea_congestiflora",
+              sp2 == "ST" ~ "Shorea_trapezifolia",
+              sp2 == "HI" ~ "Horsfieldia_irya",
+              sp2 == "DZ" ~ "Dipterocarpus_zeylanicus",
+              .default = as.character(sp2))) %>% 
+  left_join(y = read_csv("data/Phylogeny_PSFexpSpecies.csv"),
+            by = c("sp1"="X1","sp2"="X2"))
+
+ms2 <- lm(data = istot,# %>% 
+#   mutate(phylodist_Mya = phylodist_Mya/(max(istot$phylodist_Mya)-min(istot$phylodist_Mya))),
+          formula = isval ~ phylodist_Mya) # nothing with all sorts of combos
+
+figA2 <- jtools::effect_plot(model = ms2,pred = "phylodist_Mya",
+                             interval = T,int.type = "prediction",plot.points = T) + 
+  ylab("pairwise PSF - Is") + xlab("pairwise phylogenetic distance (Mya)")
+
+ggsave(filename = "results/figA2.png",
+       plot = figA2,
+       device = "png",width = 10,height = 10,units = "cm",dpi = 300)
+```
