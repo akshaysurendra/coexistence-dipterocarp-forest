@@ -5,4 +5,4 @@ The species set include pairs that host the same mycorrhizal guild (conmycorrhiz
 
 The experiments were conducted between May 2021 and Jan 2023 in the Sinharaja Biosphere Reserve in South-West Sri Lanka.
 
-Two *.csv* files to run the mainscript_pairwisePSF.RmD script are available on Data Dryad, and need to be copied into the `/data` folder before running the script.
+Two *.csv* files to run the `mainscript_pairwisePSF.RmD` script are available on Data Dryad, and need to be copied into the `/data` folder before running the script.
